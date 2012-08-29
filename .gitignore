@@ -1,0 +1,8 @@
+*~
+*.pyc
+index.yaml
+.project
+.pydevproject
+.settings
+samples
+.idea/
