@@ -25,6 +25,7 @@ from urllib import quote
 
 
 __all__ = ('PyrestoException',
+           'PyrestoInvalidOperationException',
            'PyrestoServerResponseException',
            'PyrestoInvalidRestMethodException',
            'PyrestoInvalidAuthTypeException',
@@ -33,8 +34,31 @@ __all__ = ('PyrestoException',
 ALLOWED_HTTP_METHODS = frozenset(('GET', 'POST', 'PUT', 'DELETE', 'PATCH'))
 
 
+def assert_class_instance(class_method):
+    def asserted(cls, instance, *args, **kwargs):
+        assert isinstance(instance, cls)
+        return class_method(cls, instance, *args, **kwargs)
+
+    return asserted
+
+
+def normalize_auth(class_method):
+    def normalized(cls, instance, *args, **kwargs):
+        auth = kwargs.get('auth')
+        if auth is None:
+            auth = cls._auth or instance._auth
+        kwargs['auth'] = auth
+        return class_method(cls, instance, *args, **kwargs)
+
+    return normalized
+
+
 class PyrestoException(Exception):
     """Base error class for pyresto."""
+
+
+class PyrestoInvalidOperationException(PyrestoException):
+    """Invalid operation error class for Pyresto."""
 
 
 class PyrestoServerResponseException(PyrestoException):
@@ -73,6 +97,9 @@ class ModelBase(ABCMeta):
 
         if not isinstance(new_class._pk, tuple):  # make sure it is a tuple
             new_class._pk = (new_class._pk,)
+
+        new_class.update = new_class.update_with_patch if \
+            new_class._update_method == 'PATCH' else new_class.update_with_put
 
         return new_class
 
@@ -386,10 +413,10 @@ class Foreign(Relation):
 
                 for k in self.__model._pk[:-1]:
                     ids.append(footprint[k] if k in footprint
-                                else getattr(instance, k))
+                               else getattr(instance, k))
 
                 item, key = re.match(r'(\w+)(?:\[(\w+)\])?',
-                                          key_property).groups()
+                                     key_property).groups()
                 item = getattr(instance, item)
                 ids.append(item[key] if key else item)
 
@@ -426,9 +453,13 @@ class Model(object):
 
     __metaclass__ = ModelBase
 
+    _update_method = 'PATCH'
+
     __footprint = None
 
     __pk_vals = None
+
+    _changed = None
 
     #: The class variable that holds the bae uel for the API endpoint for the
     #: :class:`Model`. This should be a "full" URL including the scheme, port
@@ -473,6 +504,13 @@ class Model(object):
     #: to override it if the response type is valid JSON.
     _parser = staticmethod(json.loads)
 
+    #: The class method which receives the class object and a property dict of
+    #: an instance to be serialized. It is expected to return a string which
+    #: will be sent to the server on modification requests such as PATCH or
+    #: CREATE. Defaults to a "staticazed" version of :func:`json.loads` so it
+    #: is not necessary to override it if the response type is valid JSON.
+    _serializer = staticmethod(json.dumps)
+
     @abstractproperty
     def _pk(self):
         """
@@ -508,11 +546,6 @@ class Model(object):
         is provided to the constructor, its value is saved under ``__father``
         to be used by the :class:`Foreign` relationship class as the id of the
         foreign :class:`Model`.
-
-        Constructor also tries to populate the :attr:`Model._current_path`
-        instance variable by formatting :attr:`Model._path` using the arguments
-        provided.
-
         """
 
         self.__dict__.update(kwargs)
@@ -523,6 +556,8 @@ class Model(object):
         for item in overlaps:
             if issubclass(getattr(cls, item), Model):
                 self.__dict__['__' + item] = self.__dict__.pop(item)
+
+        self._changed = set()
 
     @property
     def _id(self):
@@ -536,8 +571,8 @@ class Model(object):
     def _pk_vals(self):
         if not self.__pk_vals:
             if hasattr(self, '_pyresto_owner'):
-                self.__pk_vals = self._pyresto_owner.\
-                                 _pk_vals[:len(self._pk) - 1] + (self._id,)
+                self.__pk_vals = self.\
+                    _pyresto_owner._pk_vals[:len(self._pk) - 1] + (self._id,)
             else:
                 self.__pk_vals = (None,) * (len(self._pk) - 1) + (self._id,)
 
@@ -618,10 +653,13 @@ class Model(object):
                     return result(data, continuation_url)
             return result(data, None)
         else:
-            logging.error('%s returned HTTP %d: %s', url, response.status_code,
-                          kwargs)
+            msg = '%s returned HTTP %d: %s\nResponse\nHeaders: %s\nBody: %s'
+            logging.error(msg, url, response.status_code, kwargs,
+                          response.headers, response.text)
+
             raise PyrestoServerResponseException('Server response not OK. '
-                'Response code: {0:d}'.format(response.status_code))
+                                                 'Response code: {0:d}'
+                                                 .format(response.status_code))
 
     def __fetch(self):
         data, next_url = self._rest_call(url=self._current_path,
@@ -645,6 +683,15 @@ class Model(object):
         self.__fetch()
         return getattr(self, name)  # try again after fetching
 
+    def __setattr__(self, key, value):
+        if not key.startswith('_'):
+            self._changed.add(key)
+        super(Model, self).__setattr__(key, value)
+
+    def __delattr__(self, item):
+        raise PyrestoInvalidOperationException(
+            "Del method on Pyresto models is not supported.")
+
     def __eq__(self, other):
         return isinstance(other, self.__class__) and self._id == other._id
 
@@ -658,7 +705,7 @@ class Model(object):
                                                   descriptor)
 
     @classmethod
-    def get(cls, *args, **kwargs):
+    def read(cls, *args, **kwargs):
         """
         The class method that fetches and instantiates the resource defined by
         the provided pk value. Any other extra keyword arguments are used to
@@ -667,7 +714,7 @@ class Model(object):
         :param pk: The primary key value for the requested resource.
         :type pk: string
 
-        :rtype: Model or None
+        :rtype: :class:`Model` or None
 
         """
 
@@ -678,7 +725,7 @@ class Model(object):
         data = cls._rest_call(url=path, auth=auth).data
 
         if not data:
-            return
+            return None
 
         instance = cls(**data)
         instance._pk_vals = args
@@ -687,3 +734,42 @@ class Model(object):
             instance._auth = auth
 
         return instance
+
+    @classmethod
+    @normalize_auth
+    @assert_class_instance
+    def update_with_patch(cls, instance, keys=None, auth=None):
+        if keys:
+            keys &= instance._changed
+        else:
+            keys = instance._changed
+
+        data = dict((key, instance.__dict__[key]) for key in keys)
+        path = instance._current_path
+        resp = cls._rest_call(method="PATCH", url=path, auth=auth,
+                              data=cls._serializer(data)).data
+        instance.__dict__.update(resp)
+        instance._changed -= keys
+
+        return instance
+
+    @classmethod
+    @normalize_auth
+    @assert_class_instance
+    def update_with_put(cls, instance, auth=None):
+        data = instance.__dict__.copy()
+        path = instance._current_path
+        resp = cls._rest_call(method="PUT", url=path, auth=auth,
+                              data=cls._serializer(data)).data
+        instance.__dict__.update(resp)
+        instance._changed.clear()
+
+        return instance
+
+    @classmethod
+    @normalize_auth
+    @assert_class_instance
+    def delete(cls, instance, auth=None):
+        cls._rest_call(method="DELETE", url=instance._current_path, auth=auth)
+
+        return True  # will raise error if server responds with non 2xx
